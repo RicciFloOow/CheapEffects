@@ -1,0 +1,149 @@
+//Based on: NEXT GENERATION POST PROCESSING IN CALL OF DUTY: ADVANCED WARFARE
+#pragma kernel MotionBlurTilingVectorKernel
+#pragma kernel MotionBlurNeighborMaxVectorKernel
+#pragma kernel MotionBlurConstructKernel
+
+Texture2D<float2> _MotionVector_RT;
+Texture2D<float2> _MotionVectorTiled_RT;
+Texture2D<float2> _MotionVectorMaxNeighbor_RT;
+Texture2D<float4> _CamColor_RT;
+Texture2D<float> _CamDepth_RT;
+
+
+RWTexture2D<float2> RW_MotionVectorTiled_RT;
+RWTexture2D<float2> RW_MotionVectorMaxNeighbor_RT;
+RWTexture2D<float4> RW_MotionBlur_RT;
+
+
+float4 _FullScreenTexSize;//x: screen.width, y: screen.height, z: 1 / screen.width, w: 1 / screen.height
+
+SamplerState sampler_LinearClamp;
+SamplerState sampler_PointClamp;
+
+uint EncodeMotionVectorInfoToUint(float2 texSize, float2 v, uint groupIndex)
+{
+    //note that groupIndex < 400 < 2^9
+    groupIndex = groupIndex & 0x000001ff;
+    v *= texSize;
+    float sqrmagnitude = dot(v, v);
+    //if we want more accurate, use sqrt(sqrmagnitude) and separate integer part fraction part
+    uint sm = min(4194304, uint(sqrmagnitude));
+    return (sm << 9) | groupIndex;
+}
+
+uint DecodeUintToMotionVectorInfo(uint packedInfo)
+{
+    return packedInfo & 0x000001ff;//we only need groupIndex for sampling
+}
+
+float2 VMax(float2 v1, float2 v2)
+{
+    return dot(v1, v1) > dot(v2, v2) ? v1 : v2;//McGuire2012
+}
+
+groupshared uint gsMaxVector = 0;
+
+[numthreads(20, 20, 1)]//Should Not Change This!
+void MotionBlurTilingVectorKernel (uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID, uint gindex : SV_GroupIndex)
+{
+	float2 uv = saturate((_FullScreenTexSize.zw * id.xy));
+	float2 velocity = _MotionVector_RT.SampleLevel(sampler_LinearClamp, uv, 0);
+	uint packedInfo = EncodeMotionVectorInfoToUint(_FullScreenTexSize.xy, velocity, gindex);
+	InterlockedMax(gsMaxVector, packedInfo);
+	GroupMemoryBarrierWithGroupSync();
+	//
+	uint index = DecodeUintToMotionVectorInfo(gsMaxVector);//unpack max motion vector info
+	uint2 tid = (id.xy - gtid.xy) + uint2(index % 20, index / 20);
+	float2 tuv = saturate((_FullScreenTexSize.zw * tid));
+	if (gindex == 0)
+	{
+		RW_MotionVectorTiled_RT[gid.xy] = _MotionVector_RT.SampleLevel(sampler_LinearClamp, tuv, 0);//for RT with size (Screen.width / 20)*(Screen.height / 20)
+	}
+}
+
+[numthreads(8, 8, 1)]
+void MotionBlurNeighborMaxVectorKernel (uint3 id : SV_DispatchThreadID)
+{
+	float2 dxy = _FullScreenTexSize.zw * float2(20, 20);//mult float2(20, 20) if _MotionVectorTiled_RT's size is (Screen.width / 20)*(Screen.height / 20)
+	float2 uv = saturate((dxy * id.xy));
+	float4 dp = float4(1, 1, -1, 0) * dxy.xyxy;
+	//
+	float2 v_wn = _MotionVectorTiled_RT.SampleLevel(sampler_PointClamp, uv + dp.zy, 0);
+	float2 v_n = _MotionVectorTiled_RT.SampleLevel(sampler_PointClamp, uv + dp.wy, 0);
+	float2 v_en = _MotionVectorTiled_RT.SampleLevel(sampler_PointClamp, uv + dp.xy, 0);
+	//
+	float2 v_e = _MotionVectorTiled_RT.SampleLevel(sampler_PointClamp, uv + dp.xw, 0);//east
+	float2 v_c = _MotionVectorTiled_RT.SampleLevel(sampler_PointClamp, uv, 0);//center
+	float2 v_w = _MotionVectorTiled_RT.SampleLevel(sampler_PointClamp, uv + dp.zw, 0);//West
+	//
+	float2 v_ws = _MotionVectorTiled_RT.SampleLevel(sampler_PointClamp, uv - dp.xy, 0);
+	float2 v_s = _MotionVectorTiled_RT.SampleLevel(sampler_PointClamp, uv - dp.wy, 0);
+	float2 v_es = _MotionVectorTiled_RT.SampleLevel(sampler_PointClamp, uv - dp.zy, 0);
+	//
+	float2 v1 = VMax(v_wn, VMax(v_n, v_en));
+	float2 v2 = VMax(v_e, VMax(v_c, v_w));
+	float2 v3 = VMax(v_ws, VMax(v_s, v_es));
+	RW_MotionVectorMaxNeighbor_RT[id.xy] = VMax(v1, VMax(v2, v3));
+}
+
+#define halfBlurSize 3
+#define blurSize 7//2 * halfBlurSize + 1
+#define blurEffectStrength 1
+
+
+groupshared int gsWeights[8 * 8 * blurSize];
+groupshared float4 gsColors[8 * 8 * blurSize];
+
+float Snippet(uint2 id)
+{
+	float scale = 0.25;
+	float2 posMod = float2(id & 1);
+	return (-scale + 2 * scale * posMod.x) * (-1 + 2 * posMod.y);
+}
+
+[numthreads(8, 8, 1)]
+void MotionBlurConstructKernel (uint3 id : SV_DispatchThreadID, uint gindex : SV_GroupIndex)
+{
+	float2 uv = saturate((_FullScreenTexSize.zw * id.xy));
+	float4 _color_C = _CamColor_RT.SampleLevel(sampler_PointClamp, uv, 0);//center color
+	float _depth_C = _CamDepth_RT.SampleLevel(sampler_PointClamp, uv, 0);//center depth
+	float2 _velocity_C = _MotionVectorMaxNeighbor_RT.SampleLevel(sampler_PointClamp, uv, 0) * blurEffectStrength;//center velocity
+	float _IsInner = step(0.5, _color_C.w);//check if center point is inner or outer, return 0 if outer, 1 if inner
+	int i = 0;
+	[unroll(blurSize)]
+	for (i = 0; i < blurSize; i++)
+	{
+		float2 offset = _velocity_C * lerp(-1, 1, (i + Snippet(id.xy)) / (blurSize));//
+		float4 _color = _CamColor_RT.SampleLevel(sampler_PointClamp, uv + offset, 0);
+		float _depth = _CamDepth_RT.SampleLevel(sampler_PointClamp, uv + offset, 0);
+		//
+		float _isInner = step(_depth_C, _depth);
+		//
+		uint sindex = gindex + 64 * i;
+		gsColors[sindex] = _color;
+		//
+		gsWeights[sindex] = lerp(lerp(0, 1, _isInner), 1, _IsInner);//equal to lerp(_isInner, 1, _IsInner)
+	}
+	//
+	//do mirror
+	int centerWeight = 0;
+	[unroll(halfBlurSize)]
+	for (i = 0; i < halfBlurSize; i++)
+	{
+		int w = max(gsWeights[gindex + 64 * i], gsWeights[gindex + 64 * (2 * halfBlurSize - i)]);
+		gsWeights[gindex + 64 * i] = w;
+		gsWeights[gindex + 64 * (2 * halfBlurSize - i)] = w;
+		centerWeight += (2 * w);
+	}
+	gsWeights[gindex + 64 * halfBlurSize] = (blurSize - centerWeight);
+	//
+	float4 _sumCol = 0;
+	[unroll(blurSize)]
+	for (i = 0; i < blurSize; i++)
+	{
+		uint sindex = gindex + 64 * i;
+		_sumCol += gsWeights[sindex] * gsColors[sindex];
+	}
+	_sumCol /= blurSize;
+	RW_MotionBlur_RT[id.xy] = float4(_sumCol.xyz + (1 - _sumCol.w) * _color_C.xyz, 1);
+}
